@@ -1,0 +1,45 @@
+#line 2
+
+// clang-format off
+DEFINE_UI_PARAMS(num_grids, Number of Grids, DCTLUI_SLIDER_INT, 10, 1, 100, 1)
+DEFINE_UI_PARAMS(grid_thickness, Grid Thickness Px, DCTLUI_SLIDER_INT, 2, 0, 100, 1)
+DEFINE_UI_PARAMS(white_level, White Level, DCTLUI_VALUE_BOX, 1.0)
+DEFINE_UI_PARAMS(invert, Invert, DCTLUI_CHECK_BOX, 0)
+DEFINE_UI_PARAMS(chart_type, Chart Type, DCTLUI_COMBO_BOX, 0, {CHART_GRID, CHART_DOTS}, {Grid, Dots})
+
+// clang-format on
+
+__DEVICE__ float mod(float x, float y) {
+    if (x < 0) {
+        float res = _fmod(x, y);
+        if (res == 0.0f) {
+            return 0.0f;
+        }
+        return y + res;
+    } else {
+        return _fmod(x, y);
+    }
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    float3 output = make_float3(0.0, 0.0, 0.0);
+    const int grid_spacing = p_Width / num_grids;
+    const int grid_offset_x = p_Width / 2.0;
+    const int grid_offset_y = p_Height / 2.0;
+
+    if (chart_type == CHART_GRID) {
+        if (mod((p_X - grid_offset_x), grid_spacing) < grid_thickness || mod((p_Y - grid_offset_y), grid_spacing) < grid_thickness) {
+            output = make_float3(white_level, white_level, white_level);
+        }
+    } else if (chart_type == CHART_DOTS) {
+        if (mod((p_X - grid_offset_x), grid_spacing) < grid_thickness && mod((p_Y - grid_offset_y), grid_spacing) < grid_thickness) {
+            output = make_float3(white_level, white_level, white_level);
+        }
+    }
+
+    if (invert) {
+        output = white_level - output;
+    }
+
+    return output;
+}

@@ -1,0 +1,21 @@
+#line 2
+DEFINE_UI_PARAMS(r, Vec Red, DCTLUI_VALUE_BOX, 1.0)
+DEFINE_UI_PARAMS(g, Vec Green, DCTLUI_VALUE_BOX, 1.0)
+DEFINE_UI_PARAMS(b, Vec Blue, DCTLUI_VALUE_BOX, 1.0)
+DEFINE_UI_PARAMS(direction, Direction, DCTLUI_COMBO_BOX, 0, {FORWARD, BACKWARD}, {Input RGB X Vec, Vec X Input RGB})
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    float3 vec_a;
+    float3 vec_b;
+
+    if (direction == FORWARD) {
+        vec_a = make_float3(p_R, p_G, p_B);
+        vec_b = make_float3(r, g, b);
+    } else {
+        vec_a = make_float3(r, g, b);
+        vec_b = make_float3(p_R, p_G, p_B);
+    }
+
+    float3 out = make_float3(vec_a.y * vec_b.z - vec_a.z * vec_b.y, vec_a.z * vec_b.x - vec_a.x * vec_b.z, vec_a.x * vec_b.y - vec_a.y * vec_b.x);
+    return out;
+}

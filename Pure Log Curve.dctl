@@ -1,0 +1,37 @@
+#line 2
+// Based on the GoPro's log curve
+// clang-format off
+DEFINE_UI_PARAMS(base, Base, DCTLUI_VALUE_BOX, 0.0)
+DEFINE_UI_PARAMS(offset, Offset, DCTLUI_VALUE_BOX, 0.0)
+DEFINE_UI_PARAMS(scale, Scale, DCTLUI_VALUE_BOX, 0.0)
+DEFINE_UI_PARAMS(gain, Linear Gain, DCTLUI_VALUE_BOX, 1.0)
+DEFINE_UI_PARAMS(direction, Direction, DCTLUI_COMBO_BOX, 0, {LOG2LIN, LIN2LOG}, {Log to Lin, Lin to Log})
+
+// clang-format on
+
+typedef struct {
+        float base, offset, scale;
+} log_params_t;
+
+__DEVICE__ float log2lin(float x, log_params_t params) {
+    return (_powf(params.base, x) + params.offset) * params.scale;
+}
+
+__DEVICE__ float lin2log(float y, log_params_t params) {
+    return _log10f((y / params.scale) - params.offset) / _log10f(params.base);
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    log_params_t params;
+    params.base = base;
+    params.offset = offset;
+    params.scale = scale;
+
+    float3 output;
+    if (direction == LOG2LIN) {
+        output = make_float3(gain * log2lin(p_R, params), gain * log2lin(p_G, params), gain * log2lin(p_B, params));
+    } else if (direction == LIN2LOG) {
+        output = make_float3(lin2log(p_R / gain, params), lin2log(p_G / gain, params), lin2log(p_B / gain, params));
+    }
+    return output;
+}

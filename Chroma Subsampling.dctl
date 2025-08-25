@@ -1,0 +1,177 @@
+// clang-format off
+DEFINE_UI_PARAMS(xoffset, X Offset, DCTLUI_SLIDER_INT, 0, 0, 3, 1)
+DEFINE_UI_PARAMS(yoffset, Y Offset, DCTLUI_SLIDER_INT, 0, 0, 1, 1)
+DEFINE_UI_PARAMS(subsampling_type, Chroma Subsampling Type, DCTLUI_COMBO_BOX, 0, {CS444, CS440, CS422, CS420, CS411, CS410}, {4:4:4, 4:4:0, 4:2:2, 4:2:0, 4:1:1, 4:1:0})
+DEFINE_UI_PARAMS(input_format, Input Format, DCTLUI_COMBO_BOX, 0, {INPUT_RGB, INPUT_YCBCR}, {RGB, YCbCr})
+DEFINE_UI_PARAMS(output_format, Output Format, DCTLUI_COMBO_BOX, 0, {OUTPUT_RGB, OUTPUT_YCBCR}, {RGB, YCbCr})
+
+// clang-format on
+
+typedef struct {
+        int j, a, b;
+} chroma_subsample_params_t;
+
+__DEVICE__ float3 average(float3 a, float3 b) {
+    return make_float3(a.x + b.x, a.y + b.y, a.z + b.z) * 0.5f;
+}
+
+__DEVICE__ float3 rgb_to_rgb_d(float3 rgb) {
+    // Takes rgb as input, in range 0-1 where black is (0,0,0).
+    // outputs rgb_d as output, scaled 16-235.
+    float3 rgb_d = (219.0f * rgb + 16.0f);
+    return rgb_d;
+}
+
+__DEVICE__ float3 rgb_d_to_rgb(float3 rgb_d) {
+    // Takes rgb_d as input, scaled 16-235.
+    // outputs rgb, scaled 0-1
+    float3 rgb = (rgb_d - 16.0f) / 219.0f;
+    return rgb;
+}
+
+__DEVICE__ float3 rgb_d_to_ycbcr(float3 rgb_d) {
+    // Takes rgb_d as input, scaled 16-235.
+    // Follows procedure from BT709 section 3
+    float3 y_cb_cr = make_float3(0.0, 0.0, 0.0);
+    y_cb_cr.x = 0.2126 * rgb_d.x + 0.7152 * rgb_d.y + 0.0722 * rgb_d.z;
+    y_cb_cr.y = ((-0.2126 * rgb_d.x - 0.7152 * rgb_d.y + 0.9278 * rgb_d.z) / 1.8556) * (224.0 / 219.0) + 128.0;
+    y_cb_cr.z = ((0.7874 * rgb_d.x - 0.7152 * rgb_d.y - 0.0722 * rgb_d.z) / 1.5748) * (224.0 / 219.0) + 128.0;
+    return y_cb_cr; // scaled 16-235, 16-240, 16-240.
+}
+
+__DEVICE__ float3 ycbcr_to_rgb_d(float3 y_cb_cr) {
+    float3 rgb_d = make_float3(0.0, 0.0, 0.0);
+    // blue_diff is equal to rgb_d.z - Y
+    // red_diff is equal to rgb_d.x - Y
+    float blue_diff = (y_cb_cr.y - 128.0) * (219.0 / 224.0) * 1.8556;
+    float red_diff = (y_cb_cr.z - 128.0) * (219.0 / 224.0) * 1.5748;
+    rgb_d.x = red_diff + y_cb_cr.x;
+    rgb_d.z = blue_diff + y_cb_cr.x;
+    rgb_d.y = (y_cb_cr.x - (0.2126 * rgb_d.x + 0.0722 * rgb_d.z)) / 0.7152;
+    return rgb_d;
+}
+
+__DEVICE__ void get_rgb_to_ycbcr_mat(float dest[3][3], float3 lum_coeffs) {
+    // Arguably just goes to YPbPr space.
+    dest[0][0] = lum_coeffs.x;
+    dest[0][1] = lum_coeffs.y;
+    dest[0][2] = lum_coeffs.z;
+    dest[1][0] = -0.5f * (lum_coeffs.x / (1.0f - lum_coeffs.z));
+    dest[1][1] = -0.5f * (lum_coeffs.y / (1.0f - lum_coeffs.z));
+    dest[1][2] = 0.5f;
+    dest[2][0] = 0.5f;
+    dest[2][1] = -0.5f * (lum_coeffs.y / (1.0f - lum_coeffs.x));
+    dest[2][2] = -0.5f * (lum_coeffs.z / (1.0f - lum_coeffs.x));
+}
+
+__DEVICE__ void get_ycbcr_to_rgb_mat(float dest[3][3], float3 lum_coeffs) {
+    // Goes from YPbPr space to RGB.
+    dest[0][0] = 1.0f;
+    dest[0][1] = 0.0f;
+    dest[0][2] = 2.0f - 2.0f * lum_coeffs.x;
+    dest[1][0] = 1.0f;
+    dest[1][1] = -1.0f * lum_coeffs.z / lum_coeffs.y * (2.0f - 2.0f * lum_coeffs.z);
+    dest[1][2] = -1.0f * lum_coeffs.x / lum_coeffs.y * (2.0f - 2.0f * lum_coeffs.x);
+    dest[2][0] = 1.0f;
+    dest[2][1] = 2.0f - 2.0f * lum_coeffs.z;
+    dest[2][2] = 0.0f;
+}
+
+__DEVICE__ float3 chroma_subsample(chroma_subsample_params_t cs, float3 region[2][4], int rx, int ry) {
+    float3 output_region[2][4] = {{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}},
+                                  {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}}};
+
+    int new_rx = rx, new_ry = ry;
+    if (cs.a == 1) {
+        output_region[0][0] = average(average(region[0][0], region[0][1]), average(region[0][2], region[0][3]));
+        output_region[1][0] = average(average(region[1][0], region[1][1]), average(region[1][2], region[1][3]));
+        new_rx = 0;
+    } else if (cs.a == 2) {
+        output_region[0][0] = average(region[0][0], region[0][1]);
+        output_region[0][1] = average(region[0][2], region[0][3]);
+        output_region[1][0] = average(region[1][0], region[1][1]);
+        output_region[1][1] = average(region[1][2], region[1][3]);
+        new_rx = rx / 2;
+    } else if (cs.a == 4) {
+        for (int i = 0; i < 2; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                output_region[i][j] = region[i][j];
+            }
+        }
+        new_rx = rx;
+    }
+    if (cs.b == 0) {
+        for (int i = 0; i < 4; ++i) {
+            float3 avg = average(output_region[0][i], output_region[1][i]);
+            output_region[0][i] = avg;
+        }
+        new_ry = 0;
+    } else if (cs.b == cs.a) {
+        // do nothing.
+        new_ry = ry;
+    }
+    float3 output_color = output_region[new_ry][new_rx];
+    output_color.x = region[ry][rx].x;
+    return output_color;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB) {
+    int rx = (p_X + xoffset) % 4;
+    int ry = (p_Y + yoffset) % 2;
+    int r_orig_x = p_X - rx;
+    int r_orig_y = p_Y - ry;
+
+    float3 region[2][4] = {{{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}},
+                           {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}}};
+
+    for (int r = 0; r < 2; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float3 color = make_float3(
+                _tex2D(p_TexR, r_orig_x + c, r_orig_y + r), _tex2D(p_TexG, r_orig_x + c, r_orig_y + r), _tex2D(p_TexB, r_orig_x + c, r_orig_y + r));
+            if (input_format == INPUT_RGB) {
+                color = rgb_d_to_ycbcr(rgb_to_rgb_d(color));
+            } else if (input_format == INPUT_YCBCR) {
+                color = color * 255.0;
+            }
+            region[r][c] = color;
+        }
+    }
+
+    chroma_subsample_params_t params;
+    params.j = 4;
+    switch (subsampling_type) {
+        case CS410:
+            params.a = 1;
+            params.b = 0;
+            break;
+        case CS411:
+            params.a = 1;
+            params.b = 1;
+            break;
+        case CS420:
+            params.a = 2;
+            params.b = 0;
+            break;
+        case CS422:
+            params.a = 2;
+            params.b = 2;
+            break;
+        case CS440:
+            params.a = 4;
+            params.b = 0;
+            break;
+        case CS444:
+            params.a = 4;
+            params.b = 4;
+            break;
+    }
+    float3 output_color_ycrcb = chroma_subsample(params, region, rx, ry);
+    float3 output_color;
+
+    if (output_format == OUTPUT_RGB) {
+        output_color = rgb_d_to_rgb(ycbcr_to_rgb_d(output_color_ycrcb));
+    } else if (output_format == OUTPUT_YCBCR) {
+        output_color = output_color_ycrcb / 255.0f;
+    }
+    return output_color;
+}

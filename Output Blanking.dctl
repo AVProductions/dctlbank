@@ -1,0 +1,39 @@
+// clang-format off
+DEFINE_UI_PARAMS(aspect_ratio, Aspect Ratio, DCTLUI_SLIDER_FLOAT, 1.7777, 0.0, 4.0, 0.01)
+DEFINE_UI_PARAMS(value, Value, DCTLUI_VALUE_BOX, 0.0)
+
+// clang-format on
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    // Compute the timeline aspect ratio p_Width / p_Height
+    float timeline_aspect_ratio = (float)p_Width / (float)p_Height;
+
+    // Compare it to aspect ratio, see which one is bigger.
+    float desired_width;
+    float desired_height;
+    if (timeline_aspect_ratio > aspect_ratio) {
+        desired_height = p_Height;
+        desired_width = desired_height * aspect_ratio;
+    } else {
+        desired_width = p_Width;
+        desired_height = desired_width / aspect_ratio;
+    }
+
+    // Black out the region outside the computed width and height
+    float3 out = make_float3(p_R, p_G, p_B);
+
+    // Figure out how large the side bars are
+    float side_bar_width = (p_Width - desired_width) / 2.0;
+    // Figure out how large the top/bottom bars are
+    float top_bar_width = (p_Height - desired_height) / 2.0;
+
+    // Check if the current pixel is within one of the bars on the sides of the screen
+    if (p_X < _round(side_bar_width) || p_X > _round(p_Width - side_bar_width - 1) || p_Y < _round(top_bar_width) ||
+        p_Y > _round(p_Height - top_bar_width - 1)) {
+        // If within a bar, make the output pixel black.
+        out = make_float3(value, value, value);
+    }
+
+    // Return out
+    return out;
+}
