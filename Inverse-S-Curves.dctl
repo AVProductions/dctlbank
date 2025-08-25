@@ -1,0 +1,95 @@
+DEFINE_UI_PARAMS(sSteep, Curve Steepness, DCTLUI_SLIDER_FLOAT, 6, 1, 30, 1.0)
+DEFINE_UI_PARAMS(sMid, Mid Point, DCTLUI_SLIDER_FLOAT, 0.41, 0, 1, 0.1)
+DEFINE_UI_PARAMS(curveChoice, Inverse Curve Type, DCTLUI_COMBO_BOX, 0, {logType, abType, alType, tanType}, {Logistic,Absolute,Square,Hyperbolic Tangent})
+DEFINE_UI_PARAMS(timeGamma, Timeline Gamma, DCTLUI_COMBO_BOX, 0, {recGam, linGam}, {Scene,Linear})
+DEFINE_UI_PARAMS(sHeight, Height, DCTLUI_SLIDER_FLOAT, 1.0, 1.0, 13, 0.1)
+DEFINE_UI_PARAMS(isClamp, Clamp, DCTLUI_CHECK_BOX, 1)
+
+
+__DEVICE__ float invLogFunc(float s_H, float s_S, float s_M, float x) {
+	return (_logf((s_H / x) - 1.0f) / (- s_S)) + s_M ;
+}
+
+__DEVICE__ float invTanFunc(float s_H, float s_S, float s_M, float x) {
+	return ((_atanhf((x - (s_H / 2.0f))/(s_H / 2.0f)) / s_S) + s_M);
+}
+
+__DEVICE__ float invAbFunc(float s_H, float s_S, float s_M, float x) {
+	if(x >= 0.5f * s_H) return (- s_H * s_S * s_M + 0.5f * s_H + x * s_S * s_M - x) / (s_S * (x - s_H));
+	else return -1.0f * ((0.5f * s_H - x * s_S * s_M - x) / (x * s_S));
+}
+
+__DEVICE__ float invAlFunc(float s_H, float s_S, float s_M, float x) {
+
+	float xVal = (2.0f * x / s_H - 1.0f) * (2.0f * x / s_H - 1.0f);
+	float val = _sqrtf((1.0f / s_S) / (1.0f / xVal - 1.0f));
+
+	if(x >= 0.5f * s_H) return val + s_M;
+	else return (-1.0f * val) + s_M;
+}
+
+__DEVICE__ float rec_to_lin(float x) {
+	if(x < 0.081f) return (x / 4.5f);
+	else return _powf((x + 0.099f)/1.099f,(1.0f/0.45f));
+}
+
+__DEVICE__ float lin_to_rec(float x) {
+	if(x < .0018f) return 4.5f * x;
+	else return 1.099f * _powf(x,0.45f) - 0.099f;
+}
+
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+
+	float3 pRGB = {p_R, p_G, p_B};
+
+	if(isClamp) {
+		pRGB.x = _clampf(pRGB.x, 0.0f, sHeight);
+		pRGB.y = _clampf(pRGB.y, 0.0f, sHeight);
+		pRGB.z = _clampf(pRGB.z, 0.0f, sHeight);
+	}
+
+	if(timeGamma == linGam) {
+		pRGB.x = lin_to_rec(pRGB.x);
+		pRGB.y = lin_to_rec(pRGB.y);
+		pRGB.z = lin_to_rec(pRGB.z);
+	}
+
+	switch(curveChoice) {
+		case tanType:
+			pRGB.x = invTanFunc(sHeight,sSteep,sMid,pRGB.x);
+			pRGB.y = invTanFunc(sHeight,sSteep,sMid,pRGB.y);
+			pRGB.z = invTanFunc(sHeight,sSteep,sMid,pRGB.z);
+			break;
+		case abType:
+			pRGB.x = invAbFunc(sHeight,sSteep,sMid,pRGB.x);
+			pRGB.y = invAbFunc(sHeight,sSteep,sMid,pRGB.y);
+			pRGB.z = invAbFunc(sHeight,sSteep,sMid,pRGB.z);
+			break;
+		case alType:
+			pRGB.x = invAlFunc(sHeight,sSteep,sMid,pRGB.x);
+			pRGB.y = invAlFunc(sHeight,sSteep,sMid,pRGB.y);
+			pRGB.z = invAlFunc(sHeight,sSteep,sMid,pRGB.z);
+			break;
+		default: //Logistic
+			pRGB.x = invLogFunc(sHeight,sSteep,sMid,pRGB.x);
+			pRGB.y = invLogFunc(sHeight,sSteep,sMid,pRGB.y);
+			pRGB.z = invLogFunc(sHeight,sSteep,sMid,pRGB.z);
+			break;
+	}
+
+	if(timeGamma == linGam) {
+		pRGB.x = rec_to_lin(pRGB.x);
+		pRGB.y = rec_to_lin(pRGB.y);
+		pRGB.z = rec_to_lin(pRGB.z);
+	}
+
+	if(isClamp) {
+		pRGB.x = _clampf(pRGB.x, 0.0f, sHeight);
+		pRGB.y = _clampf(pRGB.y, 0.0f, sHeight);
+		pRGB.z = _clampf(pRGB.z, 0.0f, sHeight);
+	}
+
+	return pRGB;
+}

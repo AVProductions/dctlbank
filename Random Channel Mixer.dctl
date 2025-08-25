@@ -1,0 +1,144 @@
+DEFINE_UI_PARAMS(seed, Seed, DCTLUI_SLIDER_INT, 1, 1, 200, 1)
+DEFINE_UI_PARAMS(eps, Eps, DCTLUI_SLIDER_FLOAT, 0.2, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(maintain_white, Maintain White, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(show_matrix_opt, Show Matrix, DCTLUI_COMBO_BOX, 0, {OFF, VALUE, SCALED}, {Off, Float Value, Scaled Ten Bit Value})
+
+typedef struct {
+        float c00, c01, c02;
+        float c10, c11, c12;
+        float c20, c21, c22;
+} Matrix;
+
+__DEVICE__ float random(__PRIVATE__ uint* seed) {
+    uint old_seed = *seed;
+    const uint m = (1 << 31) - 1;
+    const uint a = 48271;
+    uint new_seed = (a * old_seed) % m;
+    *seed = new_seed;
+    return (((float)new_seed) / (float)m) * 2.0 - 1.0;
+}
+
+__DEVICE__ float3 matmul(__PRIVATE__ Matrix* A, float3 rgb) {
+    float3 output = make_float3(0.0, 0.0, 0.0);
+    output.x = A->c00 * rgb.x + A->c01 * rgb.y + A->c02 * rgb.z;
+    output.y = A->c10 * rgb.x + A->c11 * rgb.y + A->c12 * rgb.z;
+    output.z = A->c20 * rgb.x + A->c21 * rgb.y + A->c22 * rgb.z;
+    return output;
+}
+
+__DEVICE__ float matrix_sum(__PRIVATE__ Matrix* A) {
+    return A->c00 + A->c01 + A->c02 + A->c10 + A->c11 + A->c12 + A->c20 + A->c21 + A->c22;
+}
+
+__DEVICE__ void scale_matrix_rows_to_1(__PRIVATE__ Matrix* A) {
+    float r0_sum = A->c00 + A->c01 + A->c02;
+    float r1_sum = A->c10 + A->c11 + A->c12;
+    float r2_sum = A->c20 + A->c21 + A->c22;
+    A->c00 /= r0_sum;
+    A->c01 /= r0_sum;
+    A->c02 /= r0_sum;
+    A->c10 /= r1_sum;
+    A->c11 /= r1_sum;
+    A->c12 /= r1_sum;
+    A->c20 /= r2_sum;
+    A->c21 /= r2_sum;
+    A->c22 /= r2_sum;
+}
+
+__DEVICE__ void scale_matrix(__PRIVATE__ Matrix* A, float c) {
+    A->c00 *= c;
+    A->c01 *= c;
+    A->c02 *= c;
+    A->c10 *= c;
+    A->c11 *= c;
+    A->c12 *= c;
+    A->c20 *= c;
+    A->c21 *= c;
+    A->c22 *= c;
+}
+
+__DEVICE__ float get_mat_value(__PRIVATE__ Matrix* A, float x, float y) {
+    float out;
+    if (x < 1.0 / 3.0) {
+        if (y < 1.0 / 3.0) {
+            out = A->c00;
+        } else if (1.0 / 3.0 <= y && y < 2.0 / 3.0) {
+            out = A->c10;
+        } else {
+            out = A->c20;
+        }
+    } else if (1.0 / 3.0 <= x && x < 2.0 / 3.0) {
+        if (y < 1.0 / 3.0) {
+            out = A->c01;
+        } else if (1.0 / 3.0 <= y && y < 2.0 / 3.0) {
+            out = A->c11;
+        } else {
+            out = A->c21;
+        }
+    } else {
+        if (y < 1.0 / 3.0) {
+            out = A->c02;
+        } else if (1.0 / 3.0 <= y && y < 2.0 / 3.0) {
+            out = A->c12;
+        } else {
+            out = A->c22;
+        }
+    }
+    return out;
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B) {
+    uint state = seed;
+
+    Matrix mat;
+    mat.c00 = random(&state);
+    mat.c01 = random(&state);
+    mat.c02 = random(&state);
+    mat.c10 = random(&state);
+    mat.c11 = random(&state);
+    mat.c12 = random(&state);
+    mat.c20 = random(&state);
+    mat.c21 = random(&state);
+    mat.c22 = random(&state);
+
+    scale_matrix(&mat, eps);
+
+    mat.c00 += 1.0;
+    mat.c11 += 1.0;
+    mat.c22 += 1.0;
+
+    if (maintain_white) {
+        // each row should sum to 1.
+        scale_matrix_rows_to_1(&mat);
+    } else {
+        float mat_sum = matrix_sum(&mat);
+        scale_matrix(&mat, 3.0f / mat_sum);
+    }
+
+    float3 output_color, curr_color;
+
+    float x = (float)p_X / p_Width;
+    float y = (float)p_Y / p_Height;
+
+    if (show_matrix_opt == VALUE) {
+        // Returns the floating point value of the
+        // current entry in the matrix
+        float c = get_mat_value(&mat, x, y);
+        output_color = make_float3(c, c, c);
+    } else if (show_matrix_opt == SCALED) {
+        // Scales the result so that if you use a
+        // 10-bit RGB picker, then the value - 500
+        // represents the 2-digit value to type
+        // into the channel mixer.
+        float c = get_mat_value(&mat, x, y);
+        c *= 100.0 / 1023.0;
+        c += 500.0 / 1023.0;
+        output_color = make_float3(c, c, c);
+    } else {
+        // show_matrix_opt == OFF
+        curr_color = make_float3(p_R, p_G, p_B);
+        output_color = matmul(&mat, curr_color);
+    }
+
+    return output_color;
+}

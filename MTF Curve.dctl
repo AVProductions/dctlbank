@@ -1,0 +1,476 @@
+// clang-format off
+DEFINE_UI_PARAMS(gain1, Band 16:1 Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.1)
+DEFINE_UI_PARAMS(gain2, Band 8:1 Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.1)
+DEFINE_UI_PARAMS(gain3, Band 4:1 Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.0, 2.0, 0.1)
+DEFINE_UI_PARAMS(gain4, Band 2:1 Contrast, DCTLUI_SLIDER_FLOAT, 1.0, 0.01, 2.0, 0.1)
+DEFINE_UI_PARAMS(threshold, Threshold, DCTLUI_SLIDER_FLOAT, 0.1, 0.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(blur_scale, Blur Scale, DCTLUI_SLIDER_FLOAT, 1.0, 0.01, 5.0, 0.01)
+DEFINE_UI_PARAMS(debug_band, Debug Band, DCTLUI_SLIDER_INT, 4, 1, 4, 1)
+DEFINE_UI_PARAMS(debug_mode, Debug Mode, DCTLUI_COMBO_BOX, 0, {NONE, LP, HP, HPG, NUM_SAMPLES}, {None, Low Pass Mode, High Pass Mode, High Pass Gray Mode, Num Samples})
+DEFINE_UI_PARAMS(blur_style, Blur Style, DCTLUI_COMBO_BOX, 0, {GAUSSIAN_THRESHOLD, GAUSSIAN, PERFORMANCE}, {Gaussian Threshold, Gaussian, Performance})
+DEFINE_UI_PARAMS(method, Method, DCTLUI_COMBO_BOX, 1, {QUOTIENT, DIFFERENCE}, {Quotient, Difference})
+
+// clang-format on
+#define PI (3.14159265358979)
+#define NUM_BANDS (4)
+
+__DEVICE__ float powf(float base, float exp) {
+    float out = _copysignf(_powf(_fabs(base), exp), base);
+    return out;
+}
+
+__DEVICE__ float mixf(float x, float y, float a) {
+    return x * (1.0 - a) + y * a;
+}
+
+__DEVICE__ float powi(float x, int exp) {
+    float out = 1.0;
+    int abs_exp = exp < 0 ? exp * -1 : exp;
+    for (int i = 0; i < abs_exp; ++i) {
+        out *= x;
+    }
+    if (exp < 0) {
+        out = 1.0 / out;
+    }
+    return out;
+}
+
+__DEVICE__ float3 max_f3(float3 x, float other) {
+    return make_float3(_fmaxf(x.x, other), _fmaxf(x.y, other), _fmaxf(x.z, other));
+}
+
+__DEVICE__ float3 get_color(int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB, bool clamp) {
+    float r = _tex2D(p_TexR, p_X, p_Y);
+    float g = _tex2D(p_TexG, p_X, p_Y);
+    float b = _tex2D(p_TexB, p_X, p_Y);
+    float3 rgb = make_float3(r, g, b);
+    if (clamp) {
+        rgb = max_f3(rgb, 0.0f);
+    }
+    return rgb;
+}
+
+__DEVICE__ float get_weight_gaussian(float x, float y, float std) {
+    float rs = x * x + y * y;
+    return 1.0 / (2.0 * PI * std * std) * _expf(rs / (-2.0 * std * std));
+}
+
+__DEVICE__ int get_blur_bands_gaussian(
+    int px, int py, __TEXTURE__ pr, __TEXTURE__ pg, __TEXTURE__ pb, float scale, bool clamp, float3 ret[NUM_BANDS], int min_necessary_band) {
+
+    // Scale controls the smallest of the four blur radii.
+    float scales[NUM_BANDS] = {scale * 8.0, scale * 4.0, scale * 2.0, scale};
+    float weights[NUM_BANDS] = {0, 0, 0, 0};
+    ret[0] = make_float3(0.0, 0.0, 0.0);
+    ret[1] = make_float3(0.0, 0.0, 0.0);
+    ret[2] = make_float3(0.0, 0.0, 0.0);
+    ret[3] = make_float3(0.0, 0.0, 0.0);
+    float3 curr_color;
+    float curr_weight;
+
+    int window_radius;
+    if (min_necessary_band == NUM_BANDS) {
+        window_radius = 0;
+    } else {
+        window_radius = (int)_ceilf(scales[min_necessary_band] * 3.0);
+    }
+    if (window_radius == 0) {
+        curr_color = get_color(px, py, pr, pg, pb, clamp);
+        ret[0] = curr_color;
+        ret[1] = curr_color;
+        ret[2] = curr_color;
+        ret[3] = curr_color;
+        return powf(2.0 * window_radius + 1.0, 2.0);
+    }
+
+    for (int i = px - window_radius; i <= px + window_radius; ++i) {
+        for (int j = py - window_radius; j <= py + window_radius; ++j) {
+            curr_color = get_color(i, j, pr, pg, pb, clamp);
+            for (int k = 0; k < NUM_BANDS; ++k) {
+                curr_weight = get_weight_gaussian(px - i, py - j, scales[k]);
+                ret[k] += curr_color * curr_weight;
+                weights[k] += curr_weight;
+            }
+        }
+    }
+    for (int k = 0; k < NUM_BANDS; ++k) {
+        ret[k] = ret[k] / weights[k];
+    }
+    return powf(2.0 * window_radius + 1.0, 2.0);
+}
+
+__DEVICE__ float smoothstep2(float start, float end, float alpha) {
+    // alpha expected to be from 0 to 1.
+    // https://www.desmos.com/calculator/pernscu1gx
+    alpha = _clampf(alpha, 0.0f, 1.0f);
+    float factor;
+    if (alpha < 0.5) {
+        factor = 0.5 * powi(alpha * 2.0, 3);
+    } else {
+        factor = 0.5 * (2.0 - powi(2.0 - (alpha * 2.0), 3));
+    }
+    return mixf(start, end, factor);
+}
+
+__DEVICE__ inline float smooth_difference(float center, float runner, float threshold) {
+    // Return 1.0 when center and runner are close and 0.0 when center and runner are distance, relative to threshold.
+
+    float out = 0.0;
+    // if (_fabs(center - runner) < threshold) {
+    //     out = 1.0;
+    // }
+
+    out = smoothstep2(1.0, 0.0, 0.5 * _fabs(runner - center) / threshold);
+    return out;
+}
+
+__DEVICE__ float3 get_mask(float3 kernel_center, float3 runner, float threshold) {
+    float3 out = make_float3(0.0, 0.0, 0.0);
+    out.x = smooth_difference(kernel_center.x, runner.x, threshold);
+    out.y = smooth_difference(kernel_center.y, runner.y, threshold);
+    out.z = smooth_difference(kernel_center.z, runner.z, threshold);
+    return out;
+}
+
+__DEVICE__ int get_blur_bands_gaussian_threshold(int px,
+                                                 int py,
+                                                 __TEXTURE__ pr,
+                                                 __TEXTURE__ pg,
+                                                 __TEXTURE__ pb,
+                                                 float scale,
+                                                 float threshold,
+                                                 bool clamp,
+                                                 float3 ret[NUM_BANDS],
+                                                 int min_necessary_band) {
+
+    // Scale controls the smallest of the four blur radii.
+    float scales[NUM_BANDS] = {scale * 8.0, scale * 4.0, scale * 2.0, scale};
+    float3 weights[NUM_BANDS] = {
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+    };
+    ret[0] = make_float3(0.0, 0.0, 0.0);
+    ret[1] = make_float3(0.0, 0.0, 0.0);
+    ret[2] = make_float3(0.0, 0.0, 0.0);
+    ret[3] = make_float3(0.0, 0.0, 0.0);
+    float3 curr_pixel = get_color(px, py, pr, pg, pb, clamp);
+    float3 curr_color;
+    float3 curr_weights = make_float3(0.0, 0.0, 0.0);
+    float curr_weight;
+
+    int window_radius;
+    if (min_necessary_band == NUM_BANDS) {
+        window_radius = 0;
+    } else {
+        window_radius = (int)_ceilf(scales[min_necessary_band] * 3.0);
+    }
+    if (window_radius == 0) {
+        curr_color = curr_pixel;
+        ret[0] = curr_color;
+        ret[1] = curr_color;
+        ret[2] = curr_color;
+        ret[3] = curr_color;
+        return powf(2.0 * window_radius + 1.0, 2.0);
+    }
+
+    float3 mask;
+    for (int i = px - window_radius; i <= px + window_radius; ++i) {
+        for (int j = py - window_radius; j <= py + window_radius; ++j) {
+            curr_color = get_color(i, j, pr, pg, pb, clamp);
+            // We should consider adjusting the threshold for each frequency band.
+            mask = get_mask(curr_color, curr_pixel, threshold);
+            for (int k = 0; k < NUM_BANDS; ++k) {
+                curr_weight = get_weight_gaussian(px - i, py - j, scales[k]);
+                curr_weights = make_float3(curr_weight, curr_weight, curr_weight);
+                ret[k] += curr_color * curr_weights * mask;
+                weights[k] += curr_weights * mask;
+            }
+        }
+    }
+    for (int k = 0; k < NUM_BANDS; ++k) {
+        ret[k] = ret[k] / weights[k];
+    }
+    return powf(2.0 * window_radius + 1.0, 2.0);
+}
+
+///////////////////////////////
+// Nearest Neighbors sampling
+//////////////////////////////
+
+__DEVICE__ float sample_point_nn_1ch(float x, float y, __TEXTURE__ tex, float scale, bool clamp) {
+    const float scale_round = _round(scale);
+    const int iX = (int)(_round(x / scale_round) * scale_round);
+    const int iY = (int)(_round(y / scale_round) * scale_round);
+    float c = _tex2D(tex, iX, iY);
+    if (clamp) {
+        c = _fmaxf(c, 0.0f);
+    }
+    return c;
+}
+
+__DEVICE__ float3 sample_point_nn_3ch(float x, float y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB, float scale, bool clamp) {
+    float3 out = make_float3(0.0, 0.0, 0.0);
+    out.x = sample_point_nn_1ch(x, y, p_TexR, scale, clamp);
+    out.y = sample_point_nn_1ch(x, y, p_TexG, scale, clamp);
+    out.z = sample_point_nn_1ch(x, y, p_TexB, scale, clamp);
+    return out;
+}
+
+//////////////////////////
+// Fast Blur method
+//////////////////////////
+
+// Sampling Kernel
+// Lower left 0 is the (0,0) coordinate.
+// Number indicates the band, takes 64 samples
+// and constructs a box blur of varying qualities
+// of edge size 2, 4, 8, 16
+
+// - - - - 3 - - - 3 - - - 3 - - -
+// - - - - - - - - - - - - - - - -
+// - - 3 - - - 3 - - - 3 - - 3 - -
+// 3 - - - - - - - - - - - - - - -
+// - - - - - 2 - 2 - 2 - 2 - - - 3
+// - - 3 - 2 - 2 - 2 - 2 - - - - -
+// - - - - - 2 1 1 1 1 - 2 - 3 - -
+// 3 - - - 2 - 1 0 0 1 2 - - - - -
+// - - - - - 2 1 0 0 1 - 2 - - - 3
+// - - 3 - 2 - 1 1 1 1 2 - - - - -
+// - - - - - 2 - 2 - 2 - 2 - 3 - -
+// 3 - - - 2 - 2 - 2 - 2 - - - - -
+// - - - - - - - - - - - - - - - 3
+// - - 3 - - 3 - - - 3 - - - 3 - -
+// - - - - - - - - - - - - - - - -
+// - - - 3 - - - 3 - - - 3 - - - -
+
+__CONSTANT__ int band0_idxs[4][2] = {
+    {0, 0},
+    {0, 1},
+    {1, 0},
+    {1, 1},
+};
+
+__CONSTANT__ int band1_idxs[12][2] = {
+    {-1, -1},
+    {-1, 0},
+    {-1, 1},
+    {-1, 2},
+    {0, 2},
+    {1, 2},
+    {2, 2},
+    {2, 1},
+    {2, 0},
+    {2, -1},
+    {1, -1},
+    {0, -1},
+};
+
+__CONSTANT__ int band2_idxs[24][2] = {
+    {-2, -2}, {-2, 0}, {-2, 2}, {-1, 3}, {1, 3}, {3, 3}, {3, 1}, {3, -1}, {2, -2}, {0, -2}, {-3, -3}, {-3, -1},
+    {-3, 1},  {-3, 3}, {-2, 4}, {0, 4},  {2, 4}, {4, 4}, {4, 2}, {4, 0},  {4, -2}, {3, -3}, {1, -3},  {-1, -3},
+};
+
+__CONSTANT__ int band3_idxs[24][2] = {
+    {-5, -5},                    // *
+    {-5, -1}, {-5, 3},  {-5, 6}, // *
+    {-1, 6},  {3, 6},   {6, 6},  // *
+    {6, 2},   {6, -2},  {6, -5}, // *
+    {2, -5},  {-2, -5}, {-7, -4}, {-7, 1}, {-7, 5}, {-3, 8}, {1, 8}, {5, 8}, {8, 4}, {8, 0}, {8, -4}, {4, -7}, {0, -7}, {-4, -7},
+};
+
+__DEVICE__ int get_blur_bands_performance(
+    int px, int py, __TEXTURE__ pr, __TEXTURE__ pg, __TEXTURE__ pb, float scale, bool clamp, float3 ret[NUM_BANDS], int min_necessary_band) {
+    // Blurs the image by four different amounts, returns each one in ret.
+    float3 total = make_float3(0.0, 0.0, 0.0);
+    float coeff = 0.0;
+    float coeff_sum = 0.0;
+    float3 value;
+    float x, y;
+    scale = _fmaxf(1.0f, scale);
+    int num_samples = 0;
+    // Center of kernel
+    for (int i = 0; i < 4; ++i) {
+        x = px + ((float)band0_idxs[i][0] - 0.5) * scale;
+        y = py + ((float)band0_idxs[i][1] - 0.5) * scale;
+        value = sample_point_nn_3ch(x, y, pr, pg, pb, 1.0, clamp);
+        coeff = 1.0;
+        total += value * coeff;
+        coeff_sum += coeff;
+        num_samples += 1;
+    }
+    ret[3] = total / coeff_sum;
+    // Ring 1
+    if (min_necessary_band <= 2) {
+        for (int i = 0; i < 12; ++i) {
+            x = px + ((float)band1_idxs[i][0] - 0.5) * scale;
+            y = py + ((float)band1_idxs[i][1] - 0.5) * scale;
+            value = sample_point_nn_3ch(x, y, pr, pg, pb, 1.0, clamp);
+            coeff = 1.0;
+            total += value * coeff;
+            coeff_sum += coeff;
+            num_samples += 1;
+        }
+    }
+    ret[2] = total / coeff_sum;
+    // Ring 2
+    if (min_necessary_band <= 1) {
+        for (int i = 0; i < 24; ++i) {
+            x = px + ((float)band2_idxs[i][0] - 0.5) * scale;
+            y = py + ((float)band2_idxs[i][1] - 0.5) * scale;
+            value = sample_point_nn_3ch(x, y, pr, pg, pb, 1.0, clamp);
+            coeff = 1.0;
+            total += value * coeff;
+            coeff_sum += coeff;
+            num_samples += 1;
+        }
+    }
+    ret[1] = total / coeff_sum;
+    // Ring 3
+    if (min_necessary_band <= 0) {
+        for (int i = 0; i < 24; ++i) {
+            x = px + ((float)band3_idxs[i][0] - 0.5) * scale;
+            y = py + ((float)band3_idxs[i][1] - 0.5) * scale;
+            value = sample_point_nn_3ch(x, y, pr, pg, pb, 1.0, clamp);
+            coeff = 1.0;
+            total += value * coeff;
+            coeff_sum += coeff;
+            num_samples += 1;
+        }
+    }
+    ret[0] = total / coeff_sum;
+    return num_samples;
+}
+
+__DEVICE__ void get_blur_bands_quality(int px, int py, __TEXTURE__ pr, __TEXTURE__ pg, __TEXTURE__ pb, float scale, bool clamp, float3 ret[NUM_BANDS]) {
+    // Blurs the image by four different amounts, returns each one in ret.
+    scale = _fmaxf(1.0f, scale);
+
+    float3 value;
+    int window_radius = 8 * scale;
+    float3 band_total_values[NUM_BANDS] = {make_float3(0.0, 0.0, 0.0), make_float3(0.0, 0.0, 0.0), make_float3(0.0, 0.0, 0.0), make_float3(0.0, 0.0, 0.0)};
+    float band_total_weights[NUM_BANDS] = {0.0, 0.0, 0.0, 0.0};
+
+    for (int y = -window_radius; y <= window_radius; y++) {
+        for (int x = -window_radius; x <= window_radius; x++) {
+            float curr_distance = _hypotf((float)x, (float)y) / scale;
+            float curr_weight = 1.0;
+            int ret_idx;
+            if (curr_distance < 2) {
+                ret_idx = 3;
+                // curr_weight = 1.0;
+            } else if (curr_distance < 3) {
+                ret_idx = 2;
+                // curr_weight = 1.0;
+            } else if (curr_distance < 5) {
+                ret_idx = 1;
+                curr_weight = 0.75;
+            } else if (curr_distance <= 8) {
+                // Low pass
+                ret_idx = 0;
+                curr_weight = 0.50;
+            } else {
+                continue;
+            }
+
+            value = sample_point_nn_3ch(px + x, py + y, pr, pg, pb, 1.0, clamp);
+
+            band_total_values[ret_idx] += value * curr_weight;
+            band_total_weights[ret_idx] += curr_weight;
+        }
+    }
+
+    ret[NUM_BANDS - 1] = band_total_values[NUM_BANDS - 1] / band_total_weights[NUM_BANDS - 1];
+    for (int i = NUM_BANDS - 2; i >= 0; i--) {
+        // Aggregate it so the low frequency bands include the weights and samples from the higher frequency bands.
+        band_total_values[i] += band_total_values[i + 1];
+        band_total_weights[i] += band_total_weights[i + 1];
+        ret[i] = band_total_values[i] / band_total_weights[i];
+    }
+}
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB) {
+    float3 curr_color = get_color(p_X, p_Y, p_TexR, p_TexG, p_TexB, false);
+    // float scale = (float)p_Width / (float)compute_scale(gate_width, lpm4);
+    float scale = blur_scale * 2.0 * p_Height / 2160.0;
+    float3 downres[NUM_BANDS] = {
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+    };
+    float3 edges[NUM_BANDS] = {
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+        make_float3(0.0, 0.0, 0.0),
+    };
+    float gains[NUM_BANDS] = {gain1, gain2, gain3, gain4};
+    bool clamp = (method == QUOTIENT);
+
+    // Optimization: The low pass filter is very expensive for the lower bands, so let's just
+    // not sample the pixels for those bands if nothing is being done for the frequency band.
+    int min_necessary_band = NUM_BANDS;
+    for (int i = 0; i < NUM_BANDS; i++) {
+        if (_fabs(gains[i] - 1.0f) > 1e-6) {
+            // Edge contrast [i] is not unity. We therefore need to get downres[i] and downres[i+1]
+            min_necessary_band = i;
+            break;
+        }
+    }
+    if (debug_mode == LP || debug_mode == HP || debug_mode == HPG) {
+        // Just generate the necessary blurs for the debug mode.
+        min_necessary_band = debug_band - 1;
+    }
+
+    int num_samples = 0;
+    if (blur_style == GAUSSIAN_THRESHOLD) {
+        num_samples = get_blur_bands_gaussian_threshold(p_X, p_Y, p_TexR, p_TexG, p_TexB, scale * 0.5, threshold, clamp, downres, min_necessary_band);
+    } else if (blur_style == GAUSSIAN) {
+        num_samples = get_blur_bands_gaussian(p_X, p_Y, p_TexR, p_TexG, p_TexB, scale * 0.5, clamp, downres, min_necessary_band);
+    } else if (blur_style == PERFORMANCE) {
+        num_samples = get_blur_bands_performance(p_X, p_Y, p_TexR, p_TexG, p_TexB, scale, clamp, downres, min_necessary_band);
+    }
+    // else if (blur_style == QUALITY) {
+    //     get_blur_bands_quality(p_X, p_Y, p_TexR, p_TexG, p_TexB, scale * 0.75, clamp, downres);
+    // }
+
+    float3 result = downres[0];
+    if (method == QUOTIENT) {
+        edges[0] = downres[1] / downres[0];
+        edges[1] = downres[2] / downres[1];
+        edges[2] = downres[3] / downres[2];
+        edges[3] = curr_color / downres[3];
+        for (int i = 0; i < NUM_BANDS; ++i) {
+            result.x *= powf(edges[i].x, gains[i]);
+            result.y *= powf(edges[i].y, gains[i]);
+            result.z *= powf(edges[i].z, gains[i]);
+        }
+    } else {
+        edges[0] = downres[1] - downres[0];
+        edges[1] = downres[2] - downres[1];
+        edges[2] = downres[3] - downres[2];
+        edges[3] = curr_color - downres[3];
+        for (int i = 0; i < NUM_BANDS; ++i) {
+            result += edges[i] * gains[i];
+        }
+    }
+
+    if (debug_mode == LP) {
+        result = downres[debug_band - 1];
+    } else if (debug_mode == HP) {
+        result = edges[debug_band - 1];
+    } else if (debug_mode == HPG) {
+        if (method == QUOTIENT) {
+            // edges are 1.0 on average
+            result = edges[debug_band - 1] * 0.5f;
+        } else {
+            // edges are 0.0 on average
+            result = 0.5f + edges[debug_band - 1];
+        }
+    } else if (debug_mode == NUM_SAMPLES) {
+        result = make_float3(num_samples, num_samples, num_samples);
+    }
+    return result;
+}
